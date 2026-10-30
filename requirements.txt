@@ -1,0 +1,9 @@
+# infrastructure (CDK app)
+aws-cdk-lib>=2.275.0
+constructs>=10.0.0
+# local MCP shim
+mcp>=2.3,<3
+websockets>=13
+Pillow>=10
+# tests / local runs
+boto3
