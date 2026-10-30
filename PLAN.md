@@ -126,6 +126,91 @@ Then smoke-test against the real API:
 
 Offer a Lambda Function URL with response streaming, for clients that cannot run the stdio shim.
 
+## Parallel track: keyword intelligence (reverse-ASIN lookup)
+
+Added 2026-10-30. K1–K5 are comparable in function to Helium 10's Cerebro: give one or more ASINs, get the search
+keywords each one ranks for (organic and sponsored), with estimated search volume and competition metrics.  K6 (rank
+tracker) and K7 (market snapshot) build on the same search-result rows and the same sales model.  It runs independently of
+steps 1-5, and feeds step 4: title keywords and backend search terms come from the keywords the matched competitors
+rank for.
+
+### K1. Reverse index from the data we already have (start here, no new crawling)
+
+- The scraper's `rank_comparison` files already record where products appear for each crawled phrase.  Once the data
+  is in S3, load it into a table of one row per (keyword, date, ASIN): organic rank, sponsored rank, page, plus price,
+  reviews and "bought in past month" from the same results page.
+- Count per parent ASIN as well as per child ASIN.
+- Query by ASIN → the reverse-ASIN table.  Query by several ASINs → shared keywords, ranked by how many of them rank
+  and how high.
+- Report to the user: how many keywords and ASINs are covered, per subcategory.
+
+### K2. Keyword coverage
+
+- Grow the keyword universe per subcategory from:
+  - Amazon search autocomplete, seed + a–z / 0–9 suffixes, two levels deep;
+  - related searches on results pages;
+  - phrases recurring in winners' titles, bullets and reviews.
+- Measure how many new keywords this adds over K1 before crawling them.
+- Crawl results pages 1–3 for the new keywords with the existing scraper.  Refresh: important keywords weekly (daily
+  if needed), the long tail monthly.
+- Note to the user: Amazon's terms prohibit scraping, and a regular crawl schedule raises exposure and proxy cost.
+  Scope is our subcategories only (tens of thousands of keywords), not the whole marketplace.
+
+### K3. Search volume estimate (the hard part)
+
+- No SP-API means no Brand Analytics, so volume is a model.  Signals:
+  - autocomplete presence and position;
+  - total "bought in past month" of page-1 products divided by an assumed click and conversion share by position;
+  - number of results; sponsored-slot density.
+- Calibrate against any real numbers available, for example the user's own Seller Central search-query reports, if
+  the account has them.
+- Label volumes as estimates.  The relative order of keywords should be reliable; absolute values may be off by about
+  ±50%.  Measure that on whatever ground truth exists and report it.
+
+### K4. Metrics
+
+- Competing products; title density (page-1 titles containing the exact phrase).
+- Sales needed to reach page 1 (estimated volume × click-through curve by position vs current page-1 sales).
+- An opportunity score (volume vs competition) and rank history per ASIN and keyword.
+
+### K5. API and MCP tool
+
+- New additions to `readScreen` (additions only, via `tools/appsync_add.py`), e.g. a `reverseAsin(asins, filters)`
+  query.  Keep `eCan_lambda`'s schema copy in sync.
+- MCP tool `reverse_asin(asins, min_volume?, max_rank?, limit?)` in the shim.
+- Storage: the same database as the product DB in step 1 (Aurora + pgvector), or Athena over Parquet in S3 if the
+  rank history gets large.  Decide after K1 shows the data size.
+- Record crawl and query costs, as for listing jobs.
+
+### K6. Keyword tracker (daily rank tracking for chosen keywords)
+
+Comparable in function to Helium 10's Keyword Tracker.  Needs K1's storage.
+
+- The user picks (ASIN, keyword) pairs, their own or competitors'.  Each tracked keyword gets a guaranteed daily crawl,
+  deeper than elsewhere (5–7 pages, to find ranks around 250).
+- Same rows as K1 (keyword, date, ASIN, organic rank, sponsored rank).  Crawl from one fixed delivery ZIP code and
+  device, and store them with each rank, since rank depends on both.
+- Indexing check: search the keyword together with the ASIN and record whether the product comes back.
+- Alerts: a sharp rank change or lost indexing becomes an event on a new `readScreen` subscription (additions only),
+  following the listing-job event pattern; the MCP tool reports it.
+- Cost grows with tracked keywords × pages × days: record it per tracked keyword and show it to the user before
+  scaling up.
+
+### K7. Market snapshot of a search-results page
+
+Comparable in function to Helium 10's X-Ray.  Reuses K3's sales model.
+
+- For each product on a keyword's results page: estimated monthly sales and revenue, sales rank, price, reviews,
+  number of sellers, FBA or seller-fulfilled, fees, listing age; plus page totals to judge the market.
+- Sales estimate: per-category curve from sales rank to sales, calibrated on products that show "bought in past
+  month" (lower-bound buckets such as "1K+", so they give a floor).  Shared with K3.
+- Fees: no SP-API, so compute them from Amazon's published fee tables (size tier, weight, referral rate by category).
+  Keep the tables versioned with their effective date.
+- Price, reviews, sellers and fulfilment come from the scraped results and product pages.
+- Delivery: a `marketSnapshot(keyword)` query (additions only) and an MCP tool; later, optionally, a browser extension
+  overlaying the numbers on Amazon, as a separate client of the same API.
+- Feeds step 4: the subcategory playbook's price band and sales figures.
+
 ## Decisions (user, 2026-10-29)
 
 - **No SP-API access.** The steps above already reflect this:
