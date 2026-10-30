@@ -1,0 +1,43 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "UseCdkBootstrapRoles",
+      "Effect": "Allow",
+      "Action": ["sts:AssumeRole", "sts:TagSession"],
+      "Resource": "arn:aws:iam::667118410653:role/cdk-hnb659fds-*-667118410653-us-east-1"
+    },
+    {
+      "Sid": "PassAppSyncInvokeRoleToReadScreen",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::667118410653:role/EcanListing-AppSyncInvoke*",
+      "Condition": {"StringEquals": {"iam:PassedToService": "appsync.amazonaws.com"}}
+    },
+    {
+      "Sid": "AddEcanKnowledgeToReadScreen",
+      "Effect": "Allow",
+      "Action": [
+        "appsync:GetIntrospectionSchema",
+        "appsync:StartSchemaCreation",
+        "appsync:GetSchemaCreationStatus",
+        "appsync:GetDataSource",
+        "appsync:CreateDataSource",
+        "appsync:UpdateDataSource",
+        "appsync:GetResolver",
+        "appsync:CreateResolver",
+        "appsync:UpdateResolver"
+      ],
+      "Resource": [
+        "arn:aws:appsync:us-east-1:667118410653:apis/ydusqd3wgfb6loiu2daej6qa6y",
+        "arn:aws:appsync:us-east-1:667118410653:apis/ydusqd3wgfb6loiu2daej6qa6y/*"
+      ]
+    },
+    {
+      "Sid": "ReadEcanListingStackOutputs",
+      "Effect": "Allow",
+      "Action": ["cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents"],
+      "Resource": "arn:aws:cloudformation:us-east-1:667118410653:stack/EcanListing/*"
+    }
+  ]
+}

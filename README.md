@@ -50,6 +50,8 @@ python -m unittest tests/test_local.py          # no AWS needed
 
 ## Deploy (profile `sc`, us-east-1)
 
+`sc` cannot bootstrap CDK or create roles; an admin must do a one-time step first, see [deploy/README.md](deploy/README.md).
+
 Note: this machine has an `AWS_ACCESS_KEY_ID` environment variable with an invalid key; pass `--profile sc` explicitly.
 
 ```powershell
