@@ -7,3 +7,4 @@ websockets>=13
 Pillow>=10
 # tests / local runs
 boto3
+graphql-core>=3.2

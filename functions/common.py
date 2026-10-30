@@ -1,7 +1,8 @@
 """Shared by the API resolver and the workflow steps: job state in DynamoDB, and the event stream.
 
-Every event is written to the Events table first (jobId, seq) and then published to the AppSync Events channel
-/jobs/{jobId}.  A client that subscribes late or reconnects fetches what it missed with the `events` query.
+Every event is written to the Events table first (jobId, seq) and then published through the existing AppSync API's
+IAM-only mutation publishListingJobEvent, which feeds the subscription onListingJobEvent(jobId).  A client that
+subscribes late or reconnects fetches what it missed with getListingJobEvents.
 """
 import json
 import logging
@@ -43,18 +44,24 @@ def emit(job_id: str, stage: str, type_: str, data: dict | None = None) -> dict:
     EVENTS.put_item(Item={"jobId": job_id, "seq": seq, "event": json.dumps(evt, ensure_ascii=False),
                           "expiresAt": int(time.time()) + EVENT_TTL_DAYS * 86400})
     try:
-        publish(f"/jobs/{job_id}", evt)
+        publish(job_id, seq, evt)
     except Exception:                       # the event is persisted; subscribers recover it through the catch-up query
         log.exception("publish failed for %s seq %s", job_id, seq)
     return evt
 
 
-def publish(channel: str, evt: dict) -> None:
-    """POST one event to the AppSync Events API, signed with the function's IAM role."""
-    url = f"https://{os.environ['EVENTS_HTTP_DNS']}/event"
-    body = json.dumps({"channel": channel, "events": [json.dumps(evt, ensure_ascii=False)]}).encode()
+PUBLISH = "mutation($i: ListingJobEventInput!) { publishListingJobEvent(input: $i) { jobId seq event } }"
+
+
+def publish(job_id: str, seq: int, evt: dict) -> None:
+    """Run the publish mutation on the AppSync API, signed with the function's IAM role."""
+    url = os.environ["APPSYNC_GRAPHQL_URL"]
+    body = json.dumps({"query": PUBLISH, "variables": {"i": {"jobId": job_id, "seq": seq,
+                                                              "event": json.dumps(evt, ensure_ascii=False)}}}).encode()
     req = AWSRequest(method="POST", url=url, data=body, headers={"content-type": "application/json"})
     SigV4Auth(boto3.Session().get_credentials(), "appsync", os.environ["AWS_REGION"]).add_auth(req)
     with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=dict(req.headers), method="POST"),
                                 timeout=5) as r:
-        r.read()
+        out = json.loads(r.read())
+    if out.get("errors"):
+        raise RuntimeError(f"publishListingJobEvent: {out['errors']}")

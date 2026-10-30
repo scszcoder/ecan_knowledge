@@ -1,5 +1,17 @@
 {
   "app": "python app.py",
-  "watch": {"include": ["**"], "exclude": ["README.md", "cdk*.json", ".venv", "tests", "shim", "**/__pycache__"]},
+  "watch": {
+    "include": [
+      "**"
+    ],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      ".venv",
+      "tests",
+      "shim",
+      "**/__pycache__"
+    ]
+  },
   "context": {}
 }

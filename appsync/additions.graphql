@@ -1,0 +1,59 @@
+# ecan_knowledge additions to the existing AppSync API "readScreen" (ydusqd3wgfb6loiu2daej6qa6y).
+#
+# ADDITIONS ONLY.  tools/appsync_add.py merges this file into the LIVE schema: new types are appended, and the fields in
+# the Query / Mutation / Subscription blocks below are added to the existing blocks.  It refuses to push if any live
+# field would disappear or change, or if a name here already exists with a different definition.
+# The same block is kept in eCan_lambda/us/aws/agentScheduler/graphql/agent.graphql, so that repo's appsync_apply.py
+# still sees every live field.
+
+type ListingJob @aws_cognito_user_pools @aws_iam {
+  id: ID!
+  status: String!
+  match: AWSJSON
+  questions: AWSJSON
+  draft: AWSJSON
+  images: [String!]
+  error: String
+  updatedAt: String
+}
+
+type ListingUploadUrl @aws_cognito_user_pools {
+  key: String!
+  url: String!
+}
+
+type ListingJobEvent @aws_cognito_user_pools @aws_iam {
+  jobId: ID!
+  seq: Int!
+  event: AWSJSON!
+}
+
+input ListingJobInput {
+  jobId: ID!
+  imageKeys: [String!]!
+  notes: String
+  marketplace: String
+  targetPrice: Float
+}
+
+input ListingJobEventInput {
+  jobId: ID!
+  seq: Int!
+  event: AWSJSON!
+}
+
+type Query {
+  getListingJob(jobId: ID!): ListingJob @aws_cognito_user_pools
+  getListingJobEvents(jobId: ID!, afterSeq: Int): [ListingJobEvent!]! @aws_cognito_user_pools
+}
+
+type Mutation {
+  createListingUploadUrls(jobId: ID!, count: Int!): [ListingUploadUrl!]! @aws_cognito_user_pools
+  startListingJob(input: ListingJobInput!): ListingJob @aws_cognito_user_pools
+  answerListingJob(jobId: ID!, answers: AWSJSON!): ListingJob @aws_cognito_user_pools
+  publishListingJobEvent(input: ListingJobEventInput!): ListingJobEvent @aws_iam
+}
+
+type Subscription {
+  onListingJobEvent(jobId: ID!): ListingJobEvent @aws_cognito_user_pools @aws_subscribe(mutations : ["publishListingJobEvent"])
+}

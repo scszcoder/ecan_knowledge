@@ -1,12 +1,16 @@
-"""Serverless listing agent: AppSync GraphQL (requests) + AppSync Events (stream) + Step Functions (the job).
+"""Serverless listing agent behind the EXISTING AppSync API (readScreen): Step Functions job, Lambdas, tables, bucket.
 
-    client ──GraphQL──> AppSync ──> api λ ──> Step Functions ──> step λs ──emit──> DynamoDB events + Events /jobs/{id}
-    client <──WebSocket── AppSync Events /jobs/{jobId}
+This stack never touches the AppSync API itself.  It creates what the API's new fields need (the resolver Lambda and a
+role AppSync uses to invoke it) and lets the steps publish events through the API.  tools/appsync_add.py then adds the
+schema fields, data sources and resolvers, additions only.
+
+    client ──GraphQL (Cognito)──> readScreen ──> api λ ──> Step Functions ──> step λs
+    client <──subscription onListingJobEvent── readScreen <──publishListingJobEvent (IAM)── emit()
 """
 from pathlib import Path
 
-from aws_cdk import CfnOutput, Duration, Expiration, RemovalPolicy, Stack
-from aws_cdk import aws_appsync as appsync
+from aws_cdk import CfnOutput, Duration, RemovalPolicy, Stack
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_dynamodb as ddb
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_s3 as s3
@@ -16,6 +20,9 @@ from constructs import Construct
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = lambda_.Runtime.PYTHON_3_13
+# the existing AppSync API ("readScreen"); override with -c appsync_api_id=... -c appsync_graphql_url=...
+READSCREEN_ID = "ydusqd3wgfb6loiu2daej6qa6y"
+READSCREEN_URL = "https://3oqwpjy5jzal7ezkxrxxmnt6tq.appsync-api.us-east-1.amazonaws.com/graphql"
 
 
 class ListingStack(Stack):
@@ -32,17 +39,11 @@ class ListingStack(Stack):
                            time_to_live_attribute="expiresAt",
                            billing_mode=ddb.BillingMode.PAY_PER_REQUEST, removal_policy=RemovalPolicy.RETAIN)
 
-        # --- stream: AppSync Events.  Clients subscribe with the API key; only the step functions (IAM) publish.
-        api_key = appsync.AppSyncAuthProvider(authorization_type=appsync.AppSyncAuthorizationType.API_KEY)
-        iam = appsync.AppSyncAuthProvider(authorization_type=appsync.AppSyncAuthorizationType.IAM)
-        stream = appsync.EventApi(self, "Stream", api_name=f"{cid}-stream", authorization_config=appsync.EventApiAuthConfig(
-            auth_providers=[api_key, iam],
-            connection_auth_mode_types=[appsync.AppSyncAuthorizationType.API_KEY, appsync.AppSyncAuthorizationType.IAM],
-            default_publish_auth_mode_types=[appsync.AppSyncAuthorizationType.IAM],
-            default_subscribe_auth_mode_types=[appsync.AppSyncAuthorizationType.API_KEY]))
-        stream.add_channel_namespace("jobs")
+        api_id = self.node.try_get_context("appsync_api_id") or READSCREEN_ID
+        graphql_url = self.node.try_get_context("appsync_graphql_url") or READSCREEN_URL
+        publish_arn = f"arn:aws:appsync:{self.region}:{self.account}:apis/{api_id}/types/Mutation/fields/publishListingJobEvent"
 
-        env = {"JOBS_TABLE": jobs.table_name, "EVENTS_TABLE": events.table_name, "EVENTS_HTTP_DNS": stream.http_dns}
+        env = {"JOBS_TABLE": jobs.table_name, "EVENTS_TABLE": events.table_name, "APPSYNC_GRAPHQL_URL": graphql_url}
         code = lambda_.Code.from_asset(str(ROOT / "functions"), exclude=["__pycache__"])
 
         def fn(name: str, timeout: int = 60) -> lambda_.Function:
@@ -50,7 +51,7 @@ class ListingStack(Stack):
                                  timeout=Duration.seconds(timeout), memory_size=512, environment=env)
             jobs.grant_read_write_data(f)
             events.grant_read_write_data(f)
-            stream.grant_publish(f)
+            f.add_to_role_policy(iam.PolicyStatement(actions=["appsync:GraphQL"], resources=[publish_arn]))
             bucket.grant_read_write(f)
             return f
 
@@ -79,7 +80,7 @@ class ListingStack(Stack):
         machine = sfn.StateMachine(self, "ListingJob", definition_body=sfn.DefinitionBody.from_chainable(run),
                                    timeout=Duration.days(8))
 
-        # --- requests: AppSync GraphQL with a single Lambda resolver
+        # --- resolver for the new fields on the existing API (attached by tools/appsync_add.py)
         resolver = lambda_.Function(self, "Api", runtime=RUNTIME, handler="api.handler", code=code,
                                     timeout=Duration.seconds(25), memory_size=256,
                                     environment={**env, "UPLOAD_BUCKET": bucket.bucket_name,
@@ -89,21 +90,10 @@ class ListingStack(Stack):
         bucket.grant_put(resolver)
         machine.grant_start_execution(resolver)
         machine.grant_task_response(resolver)
+        appsync_role = iam.Role(self, "AppSyncInvoke", assumed_by=iam.ServicePrincipal("appsync.amazonaws.com"),
+                                description="readScreen data source ecanKnowledgeApi invokes the ecan_knowledge resolver")
+        resolver.grant_invoke(appsync_role)
 
-        gql = appsync.GraphqlApi(self, "Graphql", name=f"{cid}-api",
-                                 definition=appsync.Definition.from_file(str(ROOT / "api" / "schema.graphql")),
-                                 authorization_config=appsync.AuthorizationConfig(
-                                     default_authorization=appsync.AuthorizationMode(
-                                         authorization_type=appsync.AuthorizationType.API_KEY,
-                                         api_key_config=appsync.ApiKeyConfig(expires=Expiration.after(Duration.days(365))))))
-        ds = gql.add_lambda_data_source("api", resolver)
-        for type_name, field in [("Query", "listing"), ("Query", "events"), ("Mutation", "createUploadUrls"),
-                                 ("Mutation", "startListing"), ("Mutation", "answer")]:
-            ds.create_resolver(f"{type_name}-{field}", type_name=type_name, field_name=field)
-
-        # --- what the MCP shim needs (ECAN_* environment variables)
-        CfnOutput(self, "GraphqlUrl", value=gql.graphql_url)
-        CfnOutput(self, "GraphqlApiKey", value=gql.api_key or "")
-        CfnOutput(self, "EventsHttpDns", value=stream.http_dns)
-        CfnOutput(self, "EventsRealtimeDns", value=stream.realtime_dns)
-        CfnOutput(self, "EventsApiKey", value=stream.api_keys["Default"].attr_api_key)
+        CfnOutput(self, "ApiFunctionArn", value=resolver.function_arn)
+        CfnOutput(self, "AppSyncRoleArn", value=appsync_role.role_arn)
+        CfnOutput(self, "UploadBucket", value=bucket.bucket_name)

@@ -1,15 +1,17 @@
 """End-to-end test without AWS: the real step functions (stubs) and the real MCP shim, with DynamoDB, Step Functions,
-GraphQL and the AppSync Events WebSocket replaced by in-memory fakes and a local WebSocket server.
+GraphQL and the AppSync real-time (graphql-ws) endpoint replaced by in-memory fakes and a local WebSocket server.
 
     python -m unittest tests/test_local.py -v
 """
 import asyncio
+import base64
 import json
 import os
 import sys
 import threading
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / "functions"), str(ROOT / "shim")]
@@ -24,7 +26,7 @@ import ecan_listing_mcp as shim  # noqa: E402
 
 
 class FakeCloud:
-    """Jobs/events store + workflow runner + Events WebSocket server, following the protocol the shim speaks."""
+    """Jobs/events store + workflow runner + AppSync real-time server, following the protocol the shim speaks."""
 
     def __init__(self, drop_first_events: int = 0):
         self.jobs, self.events, self.subs = {}, {}, {}
@@ -44,9 +46,10 @@ class FakeCloud:
             evt = {"jobId": job, "seq": len(evs) + 1, "stage": stage, "type": type_, "data": data or {}}
             evs.append(evt)
         if evt["seq"] > self.drop:
-            for ws in list(self.subs.get(job, [])):
-                asyncio.run_coroutine_threadsafe(
-                    ws.send(json.dumps({"type": "data", "id": "x", "event": json.dumps(evt)})), self.loop)
+            row = {"jobId": job, "seq": evt["seq"], "event": json.dumps(evt)}
+            for ws, sid in list(self.subs.get(job, [])):
+                asyncio.run_coroutine_threadsafe(ws.send(json.dumps(
+                    {"type": "data", "id": sid, "payload": {"data": {"onListingJobEvent": row}}})), self.loop)
         return evt
 
     # --- the state machine, run in a thread
@@ -66,36 +69,41 @@ class FakeCloud:
 
     # --- GraphQL (replaces shim._gql_sync)
     def gql(self, query, v):
-        if "createUploadUrls" in query:
-            return {"createUploadUrls": [{"key": f"uploads/{v['j']}/{i}.jpg", "url": "fake"} for i in range(v["n"])]}
-        if "startListing" in query:
+        if "createListingUploadUrls" in query:
+            return {"createListingUploadUrls": [{"key": f"uploads/{v['j']}/{i}.jpg", "url": "fake"} for i in range(v["n"])]}
+        if "startListingJob" in query:
             i = v["i"]
             self.set_status(i["jobId"], "queued")
             threading.Thread(target=self.run, args=({"jobId": i["jobId"], "input": i},)).start()
-            return {"startListing": {"id": i["jobId"], "status": "queued"}}
-        if "answer(" in query:
+            return {"startListingJob": {"id": i["jobId"], "status": "queued"}}
+        if "answerListingJob(" in query:
             st = {**self.paused, "answers": json.loads(v["a"])}
             self.set_status(v["j"], "running", taskToken=None)
             threading.Thread(target=self.compose, args=(st,)).start()
-            return {"answer": {"id": v["j"], "status": "running"}}
-        if "events(" in query:
+            return {"answerListingJob": {"id": v["j"], "status": "running"}}
+        if "getListingJobEvents(" in query:
             with self.lock:
-                return {"events": [{"seq": e["seq"], "event": json.dumps(e)}
+                return {"getListingJobEvents": [{"seq": e["seq"], "event": json.dumps(e)}
                                    for e in self.events.get(v["j"], []) if e["seq"] > (v["a"] or 0)]}
-        if "listing(" in query:
+        if "getListingJob(" in query:
             j = self.jobs.get(v["j"], {})
-            return {"listing": {"id": v["j"], "status": j.get("status"),
+            return {"getListingJob": {"id": v["j"], "status": j.get("status"),
                                 "questions": json.dumps(j["questions"]) if j.get("questions") else None,
                                 "draft": json.dumps(j["draft"]) if j.get("draft") else None,
                                 "images": j.get("images") or []}}
         raise AssertionError(query)
 
     async def ws_handler(self, ws):
+        q = parse_qs(urlparse(ws.request.path).query)
+        assert json.loads(base64.b64decode(q["header"][0]))["Authorization"] == "tok"
+        assert json.loads(await ws.recv())["type"] == "connection_init"
+        await ws.send(json.dumps({"type": "connection_ack", "payload": {"connectionTimeoutMs": 300000}}))
         msg = json.loads(await ws.recv())
-        assert msg["type"] == "subscribe" and msg["authorization"]["x-api-key"] == "k"
-        job = msg["channel"].split("/")[-1]
-        self.subs.setdefault(job, []).append(ws)
-        await ws.send(json.dumps({"type": "subscribe_success", "id": msg["id"]}))
+        assert msg["type"] == "start" and msg["payload"]["extensions"]["authorization"]["Authorization"] == "tok"
+        job = json.loads(msg["payload"]["data"])["variables"]["j"]
+        self.subs.setdefault(job, []).append((ws, msg["id"]))
+        await ws.send(json.dumps({"type": "ka"}))
+        await ws.send(json.dumps({"type": "start_ack", "id": msg["id"]}))
         await ws.wait_closed()
 
 
@@ -111,10 +119,10 @@ class EndToEnd(unittest.TestCase):
     def go(self, cloud: FakeCloud):
         async def scenario():
             cloud.loop = asyncio.get_running_loop()
-            async with websockets.serve(cloud.ws_handler, "127.0.0.1", 0, subprotocols=["aws-appsync-event-ws"]) as srv:
+            async with websockets.serve(cloud.ws_handler, "127.0.0.1", 0, subprotocols=["graphql-ws"]) as srv:
                 port = srv.sockets[0].getsockname()[1]
-                os.environ.update(ECAN_GRAPHQL_URL="x", ECAN_GRAPHQL_KEY="k", ECAN_EVENTS_HTTP="h", ECAN_EVENTS_KEY="k",
-                                  ECAN_EVENTS_REALTIME=f"ws://127.0.0.1:{port}", ECAN_WAIT_SECONDS="20")
+                os.environ.update(ECAN_GRAPHQL_URL="https://api.example/graphql", ECAN_ID_TOKEN="tok",
+                                  ECAN_REALTIME_URL=f"ws://127.0.0.1:{port}/graphql", ECAN_WAIT_SECONDS="20")
                 shim._gql_sync = cloud.gql
                 shim._jpeg = lambda p: b"jpeg"
                 shim._put = lambda u, b: None
